@@ -5,6 +5,7 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -183,7 +184,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
+    if(do_free & !(*pte & PTE_S)){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
     }
@@ -436,4 +437,54 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// Returns the virtual address in dst_proc where mapping starts, or -1 on failure
+uint64 
+map_shared_pages(struct proc* src_proc, struct proc* dst_proc, uint64 src_va, uint64 size)
+{
+  if(size == 0) return 0;
+
+  uint64 start_va = PGROUNDDOWN(src_va);
+  uint64 end_va = PGROUNDUP(src_va + size);
+  uint64 total_size = end_va - start_va;
+  uint64 offset = src_va - start_va;
+  
+  uint64 num_pages = total_size / PGSIZE;  // Number of pages to map
+  uint64 dst_va = dst_proc->sz;  // Start mapping at the end of dst_proc's memory
+  uint64 output = dst_va + offset; // Return if everything succeeded
+  
+  for (uint64 i = 0; i < num_pages; i++) {
+    uint64 curr_src_va = start_va + i * PGSIZE;  // Source page virtual address
+    uint64 curr_dst_va = dst_va + i * PGSIZE;  // Destination page virtual address
+    
+    pte_t* src_pte = walk(src_proc->pagetable, curr_src_va, 0);
+    if(!src_pte || !(*src_pte & PTE_V) || !(*src_pte & PTE_U)) {
+      return -1;
+    }
+
+    uint64 physical_addr = PTE2PA(*src_pte);
+    int permission = PTE_FLAGS(*src_pte) | PTE_S;  // Add shared flag
+
+    if (mappages(dst_proc->pagetable, curr_dst_va, PGSIZE, physical_addr,permission) != 0){
+      return -1;
+    }
+  }
+
+  dst_proc->sz = dst_va + total_size; // Update the size of the destination process
+  return output;
+}
+
+// 
+uint64 
+unmap_shared_pages(struct proc* p, uint64 addr, uint64 size)
+{
+  if (size == 0) return -1;
+
+  uint64 start_va = PGROUNDDOWN(addr);
+  uint64 end_va = PGROUNDUP(addr + size);
+  uint64 num_pages = (end_va - start_va) / PGSIZE;
+
+  uvmunmap(p->pagetable, start_va, num_pages, 1);
+  p->sz = start_va;
 }
