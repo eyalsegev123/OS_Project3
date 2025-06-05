@@ -3,6 +3,7 @@
 #include "memlayout.h"
 #include "elf.h"
 #include "riscv.h"
+#include "spinlock.h"
 #include "defs.h"
 #include "fs.h"
 #include "proc.h"
@@ -485,6 +486,17 @@ unmap_shared_pages(struct proc* p, uint64 addr, uint64 size)
   uint64 end_va = PGROUNDUP(addr + size);
   uint64 num_pages = (end_va - start_va) / PGSIZE;
 
-  uvmunmap(p->pagetable, start_va, num_pages, 1);
+  for (uint64 va = start_va; va < end_va; va += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if (!pte || !(*pte & PTE_V) || !(*pte & PTE_U)) { 
+        return -1;  // Mapping doesn't exist
+    }
+    if (!(*pte & PTE_S)) {
+        return -1;  // Not a shared mapping
+    }
+  }
+
+  uvmunmap(p->pagetable, start_va, num_pages, 0);
   p->sz = start_va;
+  return 0;  
 }

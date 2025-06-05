@@ -3,104 +3,134 @@
 #include "kernel/riscv.h"
 #include "user/user.h"
 
-
-#define TEST_DISABLE_UNMAP 0  // Set to 1 to test cleanup on exit
+// Flag to disable unmapping in child (set via command line)
+int disable_unmap = 0;
 
 void print_process_size(char* label) {
-    printf("Process size %s: %d bytes\n", label, sbrk(0));
+    // Use sbrk(0) to get current process size
+    printf("%s: %d bytes\n", label, sbrk(0));
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     printf("=== Shared Memory Test ===\n");
     
-    // Allocate some initial memory in parent to have a base size
-    char* initial_mem = malloc(100);
-    if (!initial_mem) {
-        printf("Failed to allocate initial memory\n");
-        exit(1);
+    // Check for disable_unmap flag
+    if (argc > 1 && strcmp(argv[1], "no_unmap") == 0) {
+        disable_unmap = 1;
+        printf("Running test WITHOUT child unmapping\n");
     }
     
-    print_process_size("in parent (initial)");
+    // Allocate some memory in parent that we'll share
+    char* parent_data = malloc(100);
+    if (!parent_data) {
+        printf("Failed to allocate memory in parent\n");
+        exit(1);
+    }
+    strcpy(parent_data, "Initial data");
+    
+    print_process_size("Parent before fork");
     
     int pid = fork();
     
     if (pid == 0) {
-        // Child process
-        printf("\n--- Child Process ---\n");
-        print_process_size("in child (before mapping)");
+        // CHILD PROCESS
+        printf("\n=== CHILD PROCESS ===\n");
         
-        // Map shared pages from parent (we'll use address near the initial memory)
-        uint64 parent_addr = (uint64)initial_mem;
-        uint64 shared_addr = map_shared_pages(getppid(), parent_addr, PGSIZE);
+        print_process_size("Child before mapping");
         
-        if (shared_addr == -1) {
+        // Map shared memory from parent to child
+        // Arguments: (src_proc_pid, dst_proc_pid, src_va, size)
+        uint64 shared_addr = map_shared_pages(getppid(), getpid(), (uint64)parent_data, 100);
+        
+        if (shared_addr == (uint64)-1) {
             printf("Child: Failed to map shared pages\n");
             exit(1);
         }
         
-        printf("Child: Mapped shared memory at address %p\n", (void*)shared_addr);
-        print_process_size("in child (after mapping)");
+        printf("Child: Successfully mapped shared memory at %p\n", (void*)shared_addr);
+        print_process_size("Child after mapping");
         
-        // Write message in shared memory
-        char* shared_mem = (char*)shared_addr;
-        strcpy(shared_mem, "Hello daddy");
-        printf("Child: Wrote message to shared memory\n");
+        // Write "Hello daddy" to shared memory
+        char* shared_ptr = (char*)shared_addr;
+        strcpy(shared_ptr, "Hello daddy");
+        printf("Child: Wrote 'Hello daddy' to shared memory\n");
         
-        // Test unmapping (unless disabled for testing cleanup)
-        if (!TEST_DISABLE_UNMAP) {
-            if (unmap_shared_pages(shared_addr, PGSIZE) == 0) {
-                printf("Child: Successfully unmapped shared memory\n");
-                print_process_size("in child (after unmapping)");
-            } else {
-                printf("Child: Failed to unmap shared memory\n");
-            }
-            
-            // Test malloc after unmapping
-            char* test_malloc = malloc(200);
-            if (test_malloc) {
-                printf("Child: malloc() works properly after unmapping\n");
-                print_process_size("in child (after malloc)");
-                free(test_malloc);
-            } else {
-                printf("Child: malloc() failed after unmapping\n");
-            }
-        } else {
-            printf("Child: Skipping unmap (testing cleanup on exit)\n");
+        // Test malloc before unmapping
+        char* test_malloc1 = malloc(50);
+        if (test_malloc1) {
+            strcpy(test_malloc1, "Child malloc before unmap");
+            printf("Child: malloc() before unmap works\n");
         }
         
-        printf("Child: Exiting\n");
+        if (!disable_unmap) {
+            // Unmap shared memory
+            printf("Child: Unmapping shared memory...\n");
+            if (unmap_shared_pages(getpid(), shared_addr, 100) == 0) {
+                printf("Child: Successfully unmapped shared memory\n");
+                print_process_size("Child after unmapping");
+            } else {
+                printf("Child: Failed to unmap shared memory\n");
+                exit(1);
+            }
+            
+            // Test malloc after unmapping - should work normally now
+            char* test_malloc2 = malloc(75);
+            if (test_malloc2) {
+                strcpy(test_malloc2, "Child malloc after unmap");
+                printf("Child: malloc() after unmap works properly\n");
+                print_process_size("Child after malloc");
+                free(test_malloc2);
+            } else {
+                printf("Child: malloc() failed after unmap\n");
+            }
+            
+            if (test_malloc1) free(test_malloc1);
+        } else {
+            printf("Child: Skipping unmap to test kernel cleanup\n");
+        }
+        
+        printf("Child: Exiting...\n");
         exit(0);
         
     } else if (pid > 0) {
-        // Parent process
-        printf("\n--- Parent Process ---\n");
+        // PARENT PROCESS
+        printf("\n=== PARENT PROCESS ===\n");
         
-        // Wait a bit for child to write the message
+        // Wait for child to write to shared memory
         sleep(1);
         
-        // Read from the shared memory area
-        char* shared_mem = (char*)initial_mem;
-        printf("Parent: Message from child: '%s'\n", shared_mem);
+        // Read from our memory - should now contain "Hello daddy"
+        printf("Parent: Reading from shared memory: '%s'\n", parent_data);
         
         // Wait for child to complete
         int status;
         wait(&status);
         printf("Parent: Child exited with status %d\n", status);
         
-        if (TEST_DISABLE_UNMAP) {
-            printf("Parent: Testing access after child exit (no unmap)\n");
-            printf("Parent: Message still accessible: '%s'\n", shared_mem);
+        printf("\n=== AFTER CHILD EXIT ===\n");
+        
+        if (!disable_unmap) {
+            printf("Parent: Child unmapped properly\n");
+        } else {
+            printf("Parent: Testing kernel cleanup (child exited without unmapping)\n");
         }
         
-        // Clean up our initial allocation
-        free(initial_mem);
-        print_process_size("in parent (final)");
+        // Parent should still be able to access the data
+        printf("Parent: Data still accessible: '%s'\n", parent_data);
+        
+        // Clean up in parent
+        printf("Parent: Cleaning up...\n");
+        print_process_size("Parent before cleanup");
+        
+        free(parent_data);
+        print_process_size("Parent after cleanup");
+        
+        printf("=== Test completed successfully! ===\n");
         
     } else {
         printf("Fork failed\n");
         exit(1);
     }
     
-    printf("=== Test Complete ===\n");
     return 0;
 }
