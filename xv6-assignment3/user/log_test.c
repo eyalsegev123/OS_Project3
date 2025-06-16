@@ -10,30 +10,99 @@
 #define GET_INDEX(hdr) (((hdr) >> 16) & 0xFFFF)
 #define GET_LENGTH(hdr) ((hdr) & 0xFFFF)
 
-// Write one message to the shared buffer
+// Simple integer to string conversion
+void int_to_str(int num, char *str) {
+    if (num == 0) {
+        str[0] = '0';
+        str[1] = '\0';
+        return;
+    }
+    
+    int i = 0;
+    int temp = num;
+    
+    while (temp > 0) {
+        temp /= 10;
+        i++;
+    }
+    
+    str[i] = '\0';
+    i--;
+    
+    while (num > 0) {
+        str[i] = '0' + (num % 10);
+        num /= 10;
+        i--;
+    }
+}
+
+// Simple string concatenation
+void str_concat(char *dest, const char *src1, const char *src2, const char *src3) {
+    int i = 0;
+    
+    while (src1[i] != '\0') {
+        dest[i] = src1[i];
+        i++;
+    }
+    
+    int j = 0;
+    while (src2[j] != '\0') {
+        dest[i] = src2[j];
+        i++;
+        j++;
+    }
+    
+    j = 0;
+    while (src3[j] != '\0') {
+        dest[i] = src3[j];
+        i++;
+        j++;
+    }
+    
+    dest[i] = '\0';
+}
+
+void pseudo_sleep(int cycles) {
+  for (volatile int i = 0; i < cycles * 100000; i++);
+}
+
+// Child writes a message or a fallback header
 void child_writer(char *shared_buffer, int index, const char *msg) {
   int len = strlen(msg);
-  char *addr = shared_buffer;
+  char *addr;
+  for (int j = 0; j < index+100; j++) { // Each child tries to send index messages
+    addr = shared_buffer;
+    int wrote_message = 0;
 
-  //for each child we scan the buffer from the beginning until we find a free segment
-  while ((uint64)addr + len + 4 <= (uint64)shared_buffer + PGSIZE) {
-    // Checking for zero header
-    int old = __sync_val_compare_and_swap((int*)addr, 0, HEADER(index, len));
-    if (old == 0) {
-      // Claimed space successfully
-      memmove(addr + 4, msg, len);
-      break;
+    while ((uint64)addr + len + 4 <= (uint64)shared_buffer + PGSIZE) {
+      int old = __sync_val_compare_and_swap((int*)addr, 0, HEADER(index, len));
+      if (old == 0) {
+        memmove(addr + 4, msg, len);
+        wrote_message = 1;
+        break;
+      }
+      addr += 4 + GET_LENGTH(old);
+      addr = (char*)(((uint64)addr + 3) & ~3);
     }
 
-    // Skip to next possible header (aligned)
-    addr += 4 + GET_LENGTH(old);
-    addr = (char*)(((uint64)addr + 3) & ~3);
+    if (!wrote_message) {
+      addr = shared_buffer;
+      while ((uint64)addr + 4 <= (uint64)shared_buffer + PGSIZE) {
+        int old = __sync_val_compare_and_swap((int*)addr, 0, HEADER(index, 0));
+        if (old == 0) break;
+        addr += 4 + GET_LENGTH(old);
+        addr = (char*)(((uint64)addr + 3) & ~3);
+      }
+    }
+
+    // Optional delay between messages
+    pseudo_sleep(index + j);
   }
 
   exit(0);
 }
 
-// Live-reading messages as they arrive
+// Parent reads messages or failure headers
 void parent_reader(char *shared_buffer, char **last_read_ptr, int *messages_read) {
   char *addr = *last_read_ptr;
 
@@ -46,16 +115,19 @@ void parent_reader(char *shared_buffer, char **last_read_ptr, int *messages_read
 
     if ((uint64)(addr + 4 + len) > (uint64)shared_buffer + PGSIZE) break;
 
-    char msg[256] = {0};
-    memmove(msg, addr + 4, len);
-    msg[len] = '\0';
+    if (len == 0) {
+      printf("Child %d: FAILED to write log (buffer full)\n", index);
+    } else {
+      char msg[256] = {0};
+      memmove(msg, addr + 4, len);
+      msg[len] = '\0';
 
-    //handling edge case - the parent read an incomplete message.
-    int actual_msg_len = strlen(msg);
-    if (actual_msg_len != len) 
-        return;  // Exit without updating last_read_ptr and message_read
+      int actual_msg_len = strlen(msg);
+      if (actual_msg_len != len) return;  // Incomplete message
 
-    printf("Child %d: %s\n", index, msg);
+      printf("Child %d: %s\n", index, msg);
+    }
+
     (*messages_read)++;
 
     addr += 4 + len;
@@ -66,52 +138,48 @@ void parent_reader(char *shared_buffer, char **last_read_ptr, int *messages_read
 }
 
 int main() {
-  // Allocate shared buffer
+  // Step 1: Allocate shared buffer in parent
   char *shared_buf = malloc(PGSIZE);
   if (!shared_buf) {
     printf("malloc failed\n");
     exit(1);
   }
-  //Initialize 0 to the shared buffer
   memset(shared_buf, 0, PGSIZE);
 
-  // Fork children
+  // Step 2: Fork children
   for (int i = 0; i < MAX_CHILDREN; i++) {
     int pid = fork();
     if (pid == 0) {
-      // Child process: build and write message
+      
+      // Build message manually (no snprintf in xv6)
       char msg[64];
-      snprintf(msg, sizeof(msg), "Hello from child %d!", i);
-      sleep(i + 1);  // Optional: staggered writes
-      child_writer(shared_buf, i, msg);
-    } else if (pid < 0) {
+      char index_str[16];
+      int_to_str(i, index_str);
+      str_concat(msg, "Hello from child ", index_str, "!");
+      
+      uint64 result = map_shared_pages(getppid(), getpid(), (uint64)shared_buf, PGSIZE);
+      
+      if (result == (uint64)-1) {
+          printf("Mapping failed for child %d\n", i);
+          exit(1);
+      }
+      
+      child_writer((char*)result, i, msg);
+    }
+    else if (pid < 0) {
       printf("Fork failed for child %d\n", i);
       exit(1);
     }
   }
 
-  // Parent process: read live from shared buffer
+  // Step 3: Parent reads logs in real-time
   char *last_read = shared_buf;
   int messages_read = 0;
-  int children_finished = 0;
 
-  printf("Parent: Waiting for children to write messages...\n");
-
-  while (children_finished < MAX_CHILDREN) {
+  while (messages_read < MAX_CHILDREN) {
     parent_reader(shared_buf, &last_read, &messages_read);
-    
-    // Check if any child has exited
-    int status;
-    int pid = waitpid(-1, &status, WNOHANG);  // Non-blocking wait
-    if (pid > 0) {
-      children_finished++;
-      printf("Parent: Child %d finished (%d/%d complete)\n", 
-             pid, children_finished, MAX_CHILDREN);
-    }
-    
-    sleep(1);
   }
 
-  free(shared_buf);
   exit(0);
 }
+
