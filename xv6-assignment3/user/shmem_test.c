@@ -51,16 +51,6 @@ int main(int argc, char *argv[]) {
             if (unmap_shared_pages(getpid(), shared_addr, 100) == 0) {
                 printf("Child: Successfully unmapped shared memory\n");
                 print_process_size("Child after unmapping");
-
-                // Step 4: Test malloc
-                char* test_alloc = malloc(100);
-                if (test_alloc) {
-                    strcpy(test_alloc, "Child malloc after unmap");
-                    printf("Child: malloc after unmapping works\n");
-                    print_process_size("Child after malloc");
-                } else {
-                    printf("Child: malloc failed after unmapping\n");
-                }
             } else {
                 printf("Child: Failed to unmap shared memory\n");
                 exit(1);
@@ -68,6 +58,19 @@ int main(int argc, char *argv[]) {
         } else {
             // Step 6: Test cleanup case
             printf("Child: Skipping unmap to test kernel cleanup\n");
+        }
+
+        // Step 4: Test malloc
+        char* test_alloc = malloc(100016);
+        if (test_alloc) {
+            if (disable_unmap) {
+                printf("Child: malloc without unmap works\n");
+            } else {
+                printf("Child: malloc after unmapping works\n");
+            }
+            print_process_size("Child after malloc");
+        } else {
+            printf("Child: malloc failed after unmapping or not unmap\n");
         }
 
         printf("Child: Exiting...\n");

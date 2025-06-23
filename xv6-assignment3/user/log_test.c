@@ -70,7 +70,8 @@ void pseudo_sleep(int cycles) {
 void child_writer(char *shared_buffer, int index, const char *msg) {
   int len = strlen(msg);
   char *addr;
-  for (int j = 0; j < index+100; j++) { // Each child tries to send index messages
+  // Each child tries to send multiple messages until one is more than the buffer size
+  for (int j = 0; j < index+100; j++) { 
     addr = shared_buffer;
     int wrote_message = 0;
 
@@ -85,7 +86,7 @@ void child_writer(char *shared_buffer, int index, const char *msg) {
       addr = (char*)(((uint64)addr + 3) & ~3);
     }
 
-    if (!wrote_message) {
+    if (!wrote_message) { //MESSAGE TOO LONG SOLUTION - The buffer has no place for that message so we write a header with length 0
       addr = shared_buffer;
       while ((uint64)addr + 4 <= (uint64)shared_buffer + PGSIZE) {
         int old = __sync_val_compare_and_swap((int*)addr, 0, HEADER(index, 0));
@@ -94,7 +95,6 @@ void child_writer(char *shared_buffer, int index, const char *msg) {
         addr = (char*)(((uint64)addr + 3) & ~3);
       }
     }
-
     // Optional delay between messages
     pseudo_sleep(index + j);
   }
@@ -115,9 +115,10 @@ void parent_reader(char *shared_buffer, char **last_read_ptr, int *messages_read
 
     if ((uint64)(addr + 4 + len) > (uint64)shared_buffer + PGSIZE) break;
 
-    if (len == 0) {
+    if (len == 0) // message was too long
       printf("Child %d: FAILED to write log (buffer full)\n", index);
-    } else {
+  
+    else {
       char msg[256] = {0};
       memmove(msg, addr + 4, len);
       msg[len] = '\0';
